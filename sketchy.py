@@ -4,7 +4,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import Row, SparkSession
 
 
-spark = SparkSession.builder.appName('Test').getOrCreate()
+spark = SparkSession.builder.appName('sketchy').getOrCreate()
 
 SCHEMA = pst.StructType([
     pst.StructField('desc', pst.StringType(), True),
