@@ -57,8 +57,6 @@ class AnomalyDetector:
         self.device = self._get_device(device)
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs)
 
-    # [Previous helper methods _get_device, _device_context, _parallel_compute_stats remain the same]
-
     def _get_device(self, device: str) -> str:
         """Determine the appropriate compute device."""
         if device == "auto":

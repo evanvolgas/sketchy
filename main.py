@@ -56,7 +56,7 @@ if __name__ == "__main__":
     try:
         # Load and clean data
         df = pd.read_csv(
-            "~/Desktop/OnlineRetail.csv",
+            "~/Desktop/test.csv",
             sep=",",
         )
         df = df.fillna(0)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
         # Compare datasets with error handling
         print("\nComparing datasets...")
         results = comparator.compare_datasets(
-            dataset_a_encoded, dataset_b_encoded, embedding_cols=embedding_cols
+            dataset_a_encoded, dataset_b_encoded, embedding_cols=embedding_cols, threshold=0.05
         )
 
         # Check if results contain error
