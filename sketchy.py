@@ -1,19 +1,23 @@
-from dataclasses import dataclass
-import pandas as pd
-import numpy as np
-import torch
-from scipy import stats
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
-from sklearn.covariance import EllipticEnvelope
-from sklearn.decomposition import PCA
-import umap
-from typing import Optional, Dict, List, Tuple, Union
-from functools import lru_cache
-from sklearn.utils import resample
 import concurrent.futures
+import multiprocessing
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import torch
+import umap
+from scipy import stats
+from sklearn.covariance import EllipticEnvelope
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import resample
+
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*force_all_finite.*")
 
 
 @dataclass
@@ -122,10 +126,16 @@ class AnomalyDetector:
                 col = future_to_col[future]
                 numerical_stats[col] = future.result()
 
-        # Vectorized computation for categorical columns
-        categorical_stats = {
-            col: df[col].value_counts(normalize=True).to_dict() for col in self.categorical_cols
-        }
+        # Vectorized computation for categorical columns with proper normalization
+        categorical_stats = {}
+        for col in self.categorical_cols:
+            try:
+                value_counts = df[col].value_counts()
+                proportions = value_counts / value_counts.sum()
+                categorical_stats[col] = proportions.to_dict()
+            except Exception as e:
+                print(f"Warning: Failed to compute stats for {col}: {str(e)}")
+                categorical_stats[col] = {}
 
         self.global_stats = {
             "n_rows": len(df),
@@ -294,20 +304,34 @@ class AnomalyDetector:
                     f"Unusual {col} median: {curr_stats.median:.2f} vs baseline {baseline_stats.median:.2f}"
                 )
 
-        # Check categorical distributions using vectorized operations
+        # Check categorical distributions
         for col in self.categorical_cols:
-            curr_dist = df[col].value_counts(normalize=True)
-            baseline_dist = pd.Series(self.global_stats["categorical"][col])
-
-            # Align distributions
-            aligned_curr = curr_dist.reindex(baseline_dist.index, fill_value=0)
-
             try:
-                # Vectorized chi-square test
-                chi2, p_value = stats.chisquare(aligned_curr, baseline_dist)
-                if p_value < 0.05:
-                    anomalies.append(f"Unusual distribution in {col} (p-value: {p_value:.4f})")
-            except ValueError as e:
+                curr_dist = df[col].value_counts(normalize=True)
+                baseline_dist = pd.Series(self.global_stats["categorical"][col])
+
+                # Get all unique categories
+                all_categories = pd.Index(set(curr_dist.index) | set(baseline_dist.index))
+
+                # Align and normalize distributions
+                curr_dist = curr_dist.reindex(all_categories, fill_value=0)
+                baseline_dist = baseline_dist.reindex(all_categories, fill_value=0)
+
+                # Renormalize after alignment
+                curr_dist = curr_dist / curr_dist.sum()
+                baseline_dist = baseline_dist / baseline_dist.sum()
+
+                # Calculate Jensen-Shannon divergence
+                m = 0.5 * (curr_dist + baseline_dist)
+                jsd = 0.5 * (
+                    (curr_dist * np.log(curr_dist / m + 1e-10)).sum()
+                    + (baseline_dist * np.log(baseline_dist / m + 1e-10)).sum()
+                )
+
+                if jsd > 0.1:  # Threshold can be adjusted
+                    anomalies.append(f"Unusual distribution in {col} (JSD: {jsd:.4f})")
+
+            except Exception as e:
                 anomalies.append(f"Unable to compare distributions for {col}: {str(e)}")
 
         return anomalies
@@ -386,16 +410,8 @@ class AnomalyDetector:
         return anomalies
 
 
-from dataclasses import dataclass, field  # Added field import
-
-
 @dataclass
 class DatasetComparator:
-    """
-    A class to compare and analyze datasets with optimized performance.
-    Supports GPU acceleration, vectorized operations, and sampling for large datasets.
-    """
-
     categorical_cols: Optional[List[str]] = field(default_factory=list)
     numerical_cols: Optional[List[str]] = field(default_factory=list)
     sample_size: int = 100000
@@ -407,13 +423,14 @@ class DatasetComparator:
         self.categorical_cols = self.categorical_cols or []
         self.numerical_cols = self.numerical_cols or []
 
-        # Fix n_jobs handling
-        self.n_jobs = None if self.n_jobs is None or self.n_jobs <= 0 else self.n_jobs
+        # Optimize number of jobs based on CPU cores and task type
+        if self.n_jobs is None or self.n_jobs <= 0:
+            self.n_jobs = min(32, multiprocessing.cpu_count())  # Cap at 32 for stability
 
         # Set device
         self.device = self._get_device()
 
-        # Initialize detector with safe parameters
+        # Initialize detector with optimized parameters
         self.detector = AnomalyDetector(
             categorical_cols=self.categorical_cols,
             numerical_cols=self.numerical_cols,
@@ -421,27 +438,194 @@ class DatasetComparator:
             n_jobs=self.n_jobs,
         )
 
-        # Initialize thread pool with safe number of workers
+        # Initialize separate pools for I/O and CPU-bound operations
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs)
+        self.process_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=max(1, self.n_jobs // 2)
+        )
 
     def _get_device(self) -> str:
         """Determine the appropriate compute device."""
-        if self.use_gpu:
-            if torch.cuda.is_available():
-                return "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
 
-    @contextmanager
-    def _device_context(self, data: np.ndarray) -> torch.Tensor:
-        """Context manager for handling device-specific tensor operations."""
+    def fast_distribution_compare(
+        self, values_a: np.ndarray, values_b: np.ndarray, n_bins: int = 100
+    ) -> Dict:
+        """
+        Performs a fast distribution comparison using histogram binning and
+        the Chi-square test. Much faster than KS test for large datasets.
+        """
+        # Convert to float32 for memory efficiency
+        values_a = values_a.astype(np.float32)
+        values_b = values_b.astype(np.float32)
+
+        # Calculate range for binning
+        min_val = min(np.min(values_a), np.min(values_b))
+        max_val = max(np.max(values_a), np.max(values_b))
+
+        # Create histograms with identical bins
+        hist_a, bins = np.histogram(values_a, bins=n_bins, range=(min_val, max_val), density=True)
+        hist_b, _ = np.histogram(values_b, bins=bins, density=True)
+
+        # Add small constant to avoid division by zero
+        hist_a = hist_a + 1e-10
+        hist_b = hist_b + 1e-10
+
+        # Calculate chi-square statistic
+        chi2_stat = np.sum((hist_a - hist_b) ** 2 / (hist_a + hist_b))
+
+        # Calculate degrees of freedom (number of bins - 1)
+        df = n_bins - 1
+
+        # Calculate p-value
+        p_value = 1 - stats.chi2.cdf(chi2_stat, df)
+
+        return {
+            "statistic": float(chi2_stat),
+            "p_value": float(p_value),
+            "significant": p_value < 0.05,
+        }
+
+    def _perform_statistical_tests(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
+        """Perform statistical tests to compare distributions."""
+        results = {}
+
+        # Pre-compute and cache value counts for categorical columns
+        cat_counts_a = {
+            col: dataset_a[col].fillna("MISSING").value_counts() for col in self.categorical_cols
+        }
+        cat_counts_b = {
+            col: dataset_b[col].fillna("MISSING").value_counts() for col in self.categorical_cols
+        }
+
+        def process_categorical_column(col: str) -> Dict:
+            try:
+                counts_a = cat_counts_a[col]
+                counts_b = cat_counts_b[col]
+
+                # Get frequencies
+                total_a = counts_a.sum()
+                total_b = counts_b.sum()
+
+                # Get all unique categories
+                all_categories = pd.Index(set(counts_a.index) | set(counts_b.index))
+
+                # Calculate frequencies with fill value 0
+                freq_a = (counts_a.reindex(all_categories, fill_value=0) / total_a).values
+                freq_b = (counts_b.reindex(all_categories, fill_value=0) / total_b).values
+
+                # For high cardinality columns (like IDs), do a different comparison
+                unique_ratio = len(all_categories) / max(total_a, total_b)
+
+                if unique_ratio > 0.1:  # If more than 10% unique values
+                    overlap_ratio = len(set(counts_a.index) & set(counts_b.index)) / len(
+                        all_categories
+                    )
+                    return {
+                        "type": "high_cardinality",
+                        "unique_ratio": float(unique_ratio),
+                        "category_overlap": float(overlap_ratio),
+                        "n_categories": len(all_categories),
+                        "n_categories_a": len(counts_a),
+                        "n_categories_b": len(counts_b),
+                        "significant": overlap_ratio
+                        < 0.9,  # Consider significant if overlap is low
+                    }
+
+                # For normal categorical columns, use Jensen-Shannon divergence
+                # This is more stable than chi-square for comparing distributions
+                m = 0.5 * (freq_a + freq_b)
+                jsd = 0.5 * (
+                    np.sum(freq_a * np.log(freq_a / m + 1e-10))
+                    + np.sum(freq_b * np.log(freq_b / m + 1e-10))
+                )
+
+                return {
+                    "type": "categorical",
+                    "distance": float(jsd),
+                    "significant": jsd > 0.1,  # Threshold can be adjusted
+                    "n_categories": len(all_categories),
+                    "n_unique_a": len(counts_a),
+                    "n_unique_b": len(counts_b),
+                }
+
+            except Exception as e:
+                return {"error": f"Failed to compare distributions: {str(e)}"}
+
+        def process_numerical_column(col: str) -> Dict:
+            try:
+                values_a = dataset_a[col].fillna(0).astype(np.float32).values
+                values_b = dataset_b[col].fillna(0).astype(np.float32).values
+
+                return self.fast_distribution_compare(values_a, values_b)
+
+            except Exception as e:
+                return {"error": f"Failed to perform distribution test: {str(e)}"}
+
+        # Process all columns using a single thread pool
         try:
-            tensor = torch.tensor(data, device=self.device, dtype=torch.float32)
-            yield tensor
-        finally:
-            if self.device != "cpu":
-                torch.cuda.empty_cache() if self.device == "cuda" else None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                # Submit numerical columns
+                num_futures = {
+                    executor.submit(process_numerical_column, col): (col, "ks_test")
+                    for col in self.numerical_cols
+                }
+
+                # Submit categorical columns
+                cat_futures = {
+                    executor.submit(process_categorical_column, col): (col, "chi2_test")
+                    for col in self.categorical_cols
+                }
+
+                # Combine all futures
+                all_futures = {**num_futures, **cat_futures}
+
+                # Collect results
+                for future in concurrent.futures.as_completed(all_futures):
+                    col, test_type = all_futures[future]
+                    try:
+                        results[f"{col}_{test_type}"] = future.result()
+                    except Exception as e:
+                        results[f"{col}_{test_type}"] = {"error": str(e)}
+
+        except Exception as e:
+            print(f"Error in thread pool execution: {str(e)}")
+            return {}
+
+        return results  # Make sure this is returned
+
+    def _compare_shapes(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
+        """Compare dataset shapes efficiently."""
+        # Pre-compute memory usage stats
+        memory_usage_a = dataset_a.memory_usage(deep=True).sum()
+        memory_usage_b = dataset_b.memory_usage(deep=True).sum()
+
+        # Calculate row differences
+        row_diff = len(dataset_a) - len(dataset_b)
+        row_diff_pct = (row_diff / len(dataset_b)) * 100 if len(dataset_b) > 0 else float("inf")
+
+        return {
+            "row_counts": {
+                "dataset_a": len(dataset_a),
+                "dataset_b": len(dataset_b),
+                "difference": row_diff,
+                "difference_pct": row_diff_pct,
+            },
+            "column_counts": {
+                "dataset_a": len(dataset_a.columns),
+                "dataset_b": len(dataset_b.columns),
+                "difference": len(dataset_a.columns) - len(dataset_b.columns),
+            },
+            "memory_usage": {
+                "dataset_a": memory_usage_a,
+                "dataset_b": memory_usage_b,
+                "ratio": memory_usage_a / memory_usage_b if memory_usage_b > 0 else float("inf"),
+            },
+        }
 
     def compare_datasets(
         self,
@@ -450,221 +634,36 @@ class DatasetComparator:
         embedding_cols: Optional[List[str]] = None,
         threshold: float = 0.1,
     ) -> Dict:
-        """
-        Compare two datasets for distributional differences.
+        """Compare datasets with optimized performance."""
+        # Optimize memory usage by converting to efficient dtypes
+        for col in self.numerical_cols:
+            dataset_a[col] = dataset_a[col].astype(np.float32)
+            dataset_b[col] = dataset_b[col].astype(np.float32)
 
-        Parameters:
-        -----------
-        dataset_a : pd.DataFrame
-            First dataset
-        dataset_b : pd.DataFrame
-            Second dataset (baseline)
-        embedding_cols : list
-            Columns to use for dimensional analysis
-        threshold : float
-            Threshold for considering differences significant
+        # Handle dataset size differences efficiently
+        if len(dataset_a) > len(dataset_b) * 1.5:
+            dataset_a = dataset_a.sample(n=len(dataset_b), random_state=42)
+        elif len(dataset_b) > len(dataset_a) * 1.5:
+            dataset_b = dataset_b.sample(n=len(dataset_a), random_state=42)
 
-        Returns:
-        --------
-        dict
-            Dictionary containing comparison results
-        """
         # Fit detector on dataset B (baseline)
         self.detector.fit(dataset_b, embedding_cols=embedding_cols)
 
-        # Get anomalies in dataset A compared to B
-        anomalies = self.detector.detect_anomalies(
-            dataset_a, embedding_cols=embedding_cols, threshold=threshold
-        )
-
-        # Perform additional statistical tests in parallel
+        # Use thread pool for parallel execution
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+            # Submit tasks
+            future_anomalies = executor.submit(
+                self.detector.detect_anomalies,
+                dataset_a,
+                embedding_cols=embedding_cols,
+                threshold=threshold,
+            )
             future_stats = executor.submit(self._perform_statistical_tests, dataset_a, dataset_b)
             future_shapes = executor.submit(self._compare_shapes, dataset_a, dataset_b)
 
-            statistical_tests = future_stats.result()
-            shape_comparison = future_shapes.result()
-
-        return {
-            "anomalies": anomalies,
-            "statistical_tests": statistical_tests,
-            "shape_comparison": shape_comparison,
-        }
-
-    def _perform_statistical_tests(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
-        """Perform statistical tests to compare distributions."""
-        results = {}
-
-        def process_numerical_column(col: str) -> Dict:
-            try:
-                # Use GPU if available for numerical computations
-                if self.device != "cpu":
-                    with self._device_context(
-                        dataset_a[col].fillna(0).values
-                    ) as values_a, self._device_context(
-                        dataset_b[col].fillna(0).values
-                    ) as values_b:
-                        values_a = values_a.cpu().numpy()
-                        values_b = values_b.cpu().numpy()
-                else:
-                    values_a = dataset_a[col].fillna(0).values
-                    values_b = dataset_b[col].fillna(0).values
-
-                ks_statistic, p_value = stats.ks_2samp(values_a, values_b)
-                return {
-                    "statistic": ks_statistic,
-                    "p_value": p_value,
-                    "significant": p_value < 0.05,
-                }
-            except Exception as e:
-                return {"error": f"Failed to perform KS test: {str(e)}"}
-
-        def process_categorical_column(col: str) -> Dict:
-            try:
-                # Get value counts
-                counts_a = dataset_a[col].value_counts()
-                counts_b = dataset_b[col].value_counts()
-
-                # Align categories
-                all_categories = sorted(set(counts_a.index) | set(counts_b.index))
-                counts_a = counts_a.reindex(all_categories, fill_value=0)
-                counts_b = counts_b.reindex(all_categories, fill_value=0)
-
-                # Normalize to get proportions
-                props_a = counts_a / counts_a.sum()
-                props_b = counts_b / counts_b.sum()
-
-                # Chi-square test
-                chi2, p_value = stats.chisquare(props_a, props_b)
-                return {
-                    "statistic": chi2,
-                    "p_value": p_value,
-                    "significant": p_value < 0.05,
-                }
-            except Exception as e:
-                return {"error": f"Failed to perform chi-square test: {str(e)}"}
-
-        # Process columns in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            # Submit numerical column tests
-            future_to_num_col = {
-                executor.submit(process_numerical_column, col): col for col in self.numerical_cols
+            # Collect results
+            return {
+                "anomalies": future_anomalies.result(),
+                "statistical_tests": future_stats.result(),
+                "shape_comparison": future_shapes.result(),
             }
-
-            # Submit categorical column tests
-            future_to_cat_col = {
-                executor.submit(process_categorical_column, col): col
-                for col in self.categorical_cols
-            }
-
-            # Collect numerical results
-            for future in concurrent.futures.as_completed(future_to_num_col):
-                col = future_to_num_col[future]
-                results[f"{col}_ks_test"] = future.result()
-
-            # Collect categorical results
-            for future in concurrent.futures.as_completed(future_to_cat_col):
-                col = future_to_cat_col[future]
-                results[f"{col}_chi2_test"] = future.result()
-
-        return results
-
-    def _compare_shapes(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
-        """Compare overall shapes and characteristics of datasets."""
-        shape_info = {}
-
-        # Compare basic shapes
-        shape_info["row_counts"] = {
-            "dataset_a": len(dataset_a),
-            "dataset_b": len(dataset_b),
-            "difference_pct": (
-                (len(dataset_a) - len(dataset_b)) / len(dataset_b) * 100
-                if len(dataset_b) > 0
-                else float("inf")
-            ),
-        }
-
-        def process_numerical_column(col: str) -> Dict:
-            try:
-                # Use GPU if available for numerical computations
-                if self.device != "cpu":
-                    with self._device_context(
-                        dataset_a[col].values
-                    ) as values_a, self._device_context(dataset_b[col].values) as values_b:
-                        stats_a = {
-                            "mean": float(torch.mean(values_a)),
-                            "std": float(torch.std(values_a)),
-                            "min": float(torch.min(values_a)),
-                            "max": float(torch.max(values_a)),
-                            "25%": float(torch.quantile(values_a, 0.25)),
-                            "50%": float(torch.quantile(values_a, 0.50)),
-                            "75%": float(torch.quantile(values_a, 0.75)),
-                        }
-                        stats_b = {
-                            "mean": float(torch.mean(values_b)),
-                            "std": float(torch.std(values_b)),
-                            "min": float(torch.min(values_b)),
-                            "max": float(torch.max(values_b)),
-                            "25%": float(torch.quantile(values_b, 0.25)),
-                            "50%": float(torch.quantile(values_b, 0.50)),
-                            "75%": float(torch.quantile(values_b, 0.75)),
-                        }
-                else:
-                    stats_a = dataset_a[col].describe()
-                    stats_b = dataset_b[col].describe()
-
-                return {
-                    "mean_difference_pct": (
-                        (stats_a["mean"] - stats_b["mean"]) / stats_b["mean"] * 100
-                        if stats_b["mean"] != 0
-                        else float("inf")
-                    ),
-                    "std_difference_pct": (
-                        (stats_a["std"] - stats_b["std"]) / stats_b["std"] * 100
-                        if stats_b["std"] != 0
-                        else float("inf")
-                    ),
-                    "range_difference": {
-                        "min_difference_pct": (
-                            (stats_a["min"] - stats_b["min"]) / stats_b["min"] * 100
-                            if stats_b["min"] != 0
-                            else float("inf")
-                        ),
-                        "max_difference_pct": (
-                            (stats_a["max"] - stats_b["max"]) / stats_b["max"] * 100
-                            if stats_b["max"] != 0
-                            else float("inf")
-                        ),
-                    },
-                    "quartile_differences": {
-                        "q1_difference_pct": (
-                            (stats_a["25%"] - stats_b["25%"]) / stats_b["25%"] * 100
-                            if stats_b["25%"] != 0
-                            else float("inf")
-                        ),
-                        "q2_difference_pct": (
-                            (stats_a["50%"] - stats_b["50%"]) / stats_b["50%"] * 100
-                            if stats_b["50%"] != 0
-                            else float("inf")
-                        ),
-                        "q3_difference_pct": (
-                            (stats_a["75%"] - stats_b["75%"]) / stats_b["75%"] * 100
-                            if stats_b["75%"] != 0
-                            else float("inf")
-                        ),
-                    },
-                }
-            except Exception as e:
-                return {"error": f"Failed to compare shapes: {str(e)}"}
-
-        # Process numerical columns in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            future_to_col = {
-                executor.submit(process_numerical_column, col): col for col in self.numerical_cols
-            }
-
-            for future in concurrent.futures.as_completed(future_to_col):
-                col = future_to_col[future]
-                shape_info[col] = future.result()
-
-        return shape_info

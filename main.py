@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 from sketchy import AnomalyDetector, DatasetComparator
@@ -12,10 +14,13 @@ def prepare_embeddings(df, categorical_cols):
     return df_encoded
 
 
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*force_all_finite.*")
+
 if __name__ == "__main__":
     # Load and clean data
     df = pd.read_csv(
         "~/Desktop/OnlineRetail.csv",
+        # "~/Desktop/test.csv",
         sep=",",
     )
     df = df.replace({np.nan: 0})
