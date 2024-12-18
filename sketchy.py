@@ -537,7 +537,6 @@ class DatasetComparator:
                     }
 
                 # For normal categorical columns, use Jensen-Shannon divergence
-                # This is more stable than chi-square for comparing distributions
                 m = 0.5 * (freq_a + freq_b)
                 jsd = 0.5 * (
                     np.sum(freq_a * np.log(freq_a / m + 1e-10))
@@ -596,7 +595,7 @@ class DatasetComparator:
             print(f"Error in thread pool execution: {str(e)}")
             return {}
 
-        return results  # Make sure this is returned
+        return results
 
     def _compare_shapes(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
         """Compare dataset shapes efficiently."""
@@ -640,11 +639,23 @@ class DatasetComparator:
             dataset_a[col] = dataset_a[col].astype(np.float32)
             dataset_b[col] = dataset_b[col].astype(np.float32)
 
-        # Handle dataset size differences efficiently
-        if len(dataset_a) > len(dataset_b) * 1.5:
-            dataset_a = dataset_a.sample(n=len(dataset_b), random_state=42)
-        elif len(dataset_b) > len(dataset_a) * 1.5:
-            dataset_b = dataset_b.sample(n=len(dataset_a), random_state=42)
+        # Calculate target size as minimum of dataset sizes and sample_size
+        target_size = min(len(dataset_a), len(dataset_b), self.sample_size)
+
+        # Fast sampling using numpy for both datasets if needed
+        if len(dataset_a) > target_size:
+            # Generate random indices without replacement using numpy
+            idx_a = np.random.RandomState(42).choice(
+                len(dataset_a), size=target_size, replace=False
+            )
+            # Use numpy's advanced indexing which is faster than pandas sample
+            dataset_a = dataset_a.iloc[idx_a]
+
+        if len(dataset_b) > target_size:
+            idx_b = np.random.RandomState(42).choice(
+                len(dataset_b), size=target_size, replace=False
+            )
+            dataset_b = dataset_b.iloc[idx_b]
 
         # Fit detector on dataset B (baseline)
         self.detector.fit(dataset_b, embedding_cols=embedding_cols)
