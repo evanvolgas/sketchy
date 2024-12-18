@@ -2,6 +2,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+
 from sketchy import AnomalyDetector, DatasetComparator
 from sklearn.model_selection import train_test_split
 
@@ -44,7 +45,9 @@ if __name__ == "__main__":
 
     # Initialize and fit detector on baseline data
     detector = AnomalyDetector(categorical_cols=categorical_cols, numerical_cols=numerical_cols)
-    detector.fit(dataset_a_encoded, embedding_cols=embedding_cols, contamination=0.1)
+    detector.fit(
+        dataset_a_encoded, embedding_cols=embedding_cols, contamination=0.1, dim_reduction="pca"
+    )
 
     # Detect anomalies in test data
     anomalies = detector.detect_anomalies(

@@ -4,7 +4,7 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -658,7 +658,7 @@ class DatasetComparator:
             dataset_b = dataset_b.iloc[idx_b]
 
         # Fit detector on dataset B (baseline)
-        self.detector.fit(dataset_b, embedding_cols=embedding_cols)
+        self.detector.fit(dataset_b, embedding_cols=embedding_cols, dim_reduction="pca")
 
         # Use thread pool for parallel execution
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
