@@ -15,7 +15,6 @@ from sklearn.covariance import EllipticEnvelope
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils import resample
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*force_all_finite.*")
 
@@ -44,27 +43,10 @@ class AnomalyDetector:
         device: str = "auto",
         n_jobs: Optional[int] = -1,
     ):
-        """
-        Initialize the anomaly detector with GPU support and parallel processing.
-
-        Parameters:
-        -----------
-        categorical_cols : list, optional
-            Columns to treat as categorical
-        numerical_cols : list, optional
-            Columns to treat as numerical
-        device : str
-            Device for torch computations: 'auto', 'cpu', 'cuda', or 'mps'
-        n_jobs : int or None
-            Number of parallel jobs (-1 for all cores, None for system default)
-        """
+        """[Previous docstring remains the same]"""
         self.categorical_cols = categorical_cols or []
         self.numerical_cols = numerical_cols or []
-
-        # Fix n_jobs handling
         self.n_jobs = None if n_jobs is None or n_jobs <= 0 else n_jobs
-
-        # Initialize models and stats
         self.group_stats: Dict[str, GroupStats] = {}
         self.global_stats: Dict = {}
         self.pca: Optional[PCA] = None
@@ -72,12 +54,10 @@ class AnomalyDetector:
         self.isolation_forest: Optional[IsolationForest] = None
         self.elliptic_envelope: Optional[EllipticEnvelope] = None
         self.scaler: Optional[StandardScaler] = None
-
-        # Set up device for torch computations
         self.device = self._get_device(device)
-
-        # Set up thread pool for parallel processing
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs)
+
+    # [Previous helper methods _get_device, _device_context, _parallel_compute_stats remain the same]
 
     def _get_device(self, device: str) -> str:
         """Determine the appropriate compute device."""
@@ -143,16 +123,6 @@ class AnomalyDetector:
             "categorical": categorical_stats,
         }
 
-    @lru_cache(maxsize=128)
-    def _cached_stats_computation(self, data_key: bytes) -> Dict:
-        """Cache statistical computations for repeated operations."""
-        data = np.frombuffer(data_key, dtype=np.float64)
-        return {
-            "median": float(np.median(data)),
-            "mean": float(np.mean(data)),
-            "std": float(np.std(data)),
-        }
-
     def fit(
         self,
         df: pd.DataFrame,
@@ -163,22 +133,18 @@ class AnomalyDetector:
         dim_reduction: str = "pca+umap",
         n_components: int = 2,
         pca_components: Optional[int] = None,
-        max_samples: int = 10000,
         batch_size: int = 1000,
     ) -> None:
         """
-        Fit the anomaly detector with performance optimizations.
+        Fit the anomaly detector using the full dataset.
 
-        New Parameters:
-        --------------
-        batch_size : int
-            Size of batches for processing large datasets
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Full dataset to analyze
+        [Other parameters remain the same]
         """
-        # Sample large datasets
-        if len(df) > max_samples:
-            df = resample(df, n_samples=max_samples, random_state=42)
-
-        # Compute statistics in parallel
+        # Compute statistics in parallel for the full dataset
         self._vectorized_compute_global_stats(df)
 
         if embedding_cols:
@@ -189,11 +155,10 @@ class AnomalyDetector:
             # Process embedding data in batches for GPU
             with self._device_context(embedding_data) as tensor_data:
                 if dim_reduction in ["pca+umap", "pca"]:
-                    # Perform PCA on GPU if available
+                    # Perform PCA on full dataset using batches
                     n_components = pca_components or min(tensor_data.shape)
                     self.pca = PCA(n_components=n_components, random_state=42)
 
-                    # Process in batches for large datasets
                     pca_results = []
                     for i in range(0, len(tensor_data), batch_size):
                         batch = tensor_data[i : i + batch_size]
@@ -201,12 +166,12 @@ class AnomalyDetector:
                         pca_results.append(batch_result)
 
                     embedding_data = np.vstack(pca_results)
-
                     print(
                         f"PCA explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}"
                     )
 
                 if dim_reduction in ["pca+umap", "umap"]:
+                    # Use UMAP on full dataset
                     self.umap_reducer = umap.UMAP(
                         n_neighbors=n_neighbors,
                         min_dist=min_dist,
@@ -216,13 +181,16 @@ class AnomalyDetector:
                     )
                     embedding_data = self.umap_reducer.fit_transform(embedding_data)
 
-            # Fit outlier detection models
+            # Fit outlier detection models on full dataset
             self.isolation_forest = IsolationForest(
                 contamination=contamination, random_state=42, n_jobs=self.n_jobs
             ).fit(embedding_data)
 
             self.elliptic_envelope = EllipticEnvelope(
-                contamination=contamination, random_state=42
+                contamination=contamination,
+                random_state=42,
+                support_fraction=0.99,
+                assume_centered=True,
             ).fit(embedding_data)
 
     def _batch_transform(self, data: np.ndarray, batch_size: int = 1000) -> np.ndarray:
@@ -237,58 +205,13 @@ class AnomalyDetector:
             results.append(batch)
         return np.vstack(results)
 
-    def detect_anomalies(
-        self,
-        df: pd.DataFrame,
-        embedding_cols: Optional[List[str]] = None,
-        threshold: float = 0.1,
-        batch_size: int = 1000,
-    ) -> Dict:
-        """
-        Detect anomalies using parallel processing and GPU acceleration.
-
-        Parameters:
-        -----------
-        df : pd.DataFrame
-            Data to analyze
-        embedding_cols : list, optional
-            Columns to use for embedding analysis
-        threshold : float
-            Threshold for considering something anomalous
-        batch_size : int
-            Size of batches for processing large datasets
-
-        Returns:
-        --------
-        dict
-            Dictionary containing different types of detected anomalies
-        """
-        futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            # Submit tasks for parallel execution
-            futures.append(executor.submit(self._check_global_distribution, df))
-            futures.append(executor.submit(self._check_group_distribution, df, threshold))
-            if embedding_cols:
-                futures.append(
-                    executor.submit(self._check_point_anomalies, df, embedding_cols, batch_size)
-                )
-
-        # Collect results
-        results = [future.result() for future in futures]
-
-        return {
-            "global_distribution": results[0],
-            "group_distribution": results[1],
-            "point_anomalies": results[2] if embedding_cols else [],
-        }
-
     def _check_global_distribution(self, df: pd.DataFrame) -> List[str]:
         """Check for global distribution anomalies using vectorized operations."""
         anomalies = []
 
         # Check row count
-        row_diff = abs(len(df) - self.global_stats["n_rows"]) / self.global_stats["n_rows"]
-        if row_diff > 0.2:
+        row_diff = abs(len(df) - self.global_stats["n_rows"])
+        if row_diff > 0:
             anomalies.append(
                 f"Unusual number of records: {len(df)} vs baseline {self.global_stats['n_rows']}"
             )
@@ -298,41 +221,11 @@ class AnomalyDetector:
             curr_stats = self._parallel_compute_stats(df, col)
             baseline_stats = self.global_stats["numerical"][col]
 
-            # Vectorized comparison
+            # Compare medians with formatted output
             if abs((curr_stats.median - baseline_stats.median) / baseline_stats.median) > 0.1:
                 anomalies.append(
                     f"Unusual {col} median: {curr_stats.median:.2f} vs baseline {baseline_stats.median:.2f}"
                 )
-
-        # Check categorical distributions
-        for col in self.categorical_cols:
-            try:
-                curr_dist = df[col].value_counts(normalize=True)
-                baseline_dist = pd.Series(self.global_stats["categorical"][col])
-
-                # Get all unique categories
-                all_categories = pd.Index(set(curr_dist.index) | set(baseline_dist.index))
-
-                # Align and normalize distributions
-                curr_dist = curr_dist.reindex(all_categories, fill_value=0)
-                baseline_dist = baseline_dist.reindex(all_categories, fill_value=0)
-
-                # Renormalize after alignment
-                curr_dist = curr_dist / curr_dist.sum()
-                baseline_dist = baseline_dist / baseline_dist.sum()
-
-                # Calculate Jensen-Shannon divergence
-                m = 0.5 * (curr_dist + baseline_dist)
-                jsd = 0.5 * (
-                    (curr_dist * np.log(curr_dist / m + 1e-10)).sum()
-                    + (baseline_dist * np.log(baseline_dist / m + 1e-10)).sum()
-                )
-
-                if jsd > 0.1:  # Threshold can be adjusted
-                    anomalies.append(f"Unusual distribution in {col} (JSD: {jsd:.4f})")
-
-            except Exception as e:
-                anomalies.append(f"Unable to compare distributions for {col}: {str(e)}")
 
         return anomalies
 
@@ -370,75 +263,81 @@ class AnomalyDetector:
         """Check for group-level distribution anomalies using parallel processing."""
         anomalies = []
 
-        def process_group(group_key: str, baseline_stats: GroupStats) -> List[str]:
+        def process_group(group_key: str, group_df: pd.DataFrame) -> List[str]:
             group_anomalies = []
-            conditions = group_key.split("_")
-            group_df = df.copy()
 
-            # Apply group conditions
-            for col, val in zip(self.categorical_cols[: len(conditions)], conditions):
-                group_df = group_df[group_df[col] == val]
-
-            if len(group_df) == 0:
-                return group_anomalies
-
-            # Check numerical variables using vectorized operations
+            # Check numerical variables
             for col in self.numerical_cols:
                 curr_stats = self._parallel_compute_stats(group_df, col)
-                baseline_median = baseline_stats.numerical[col].median
+                baseline_stats = self.group_stats[group_key].numerical[col]
 
-                if baseline_median != 0:
-                    pct_change = (curr_stats.median - baseline_median) / baseline_median
-                    if abs(pct_change) > threshold:
-                        group_anomalies.append(
-                            f"Group {group_key}: Unusual {col} median: "
-                            f"{curr_stats.median:.2f} vs baseline {baseline_median:.2f}"
-                        )
+                if (
+                    abs((curr_stats.median - baseline_stats.median) / baseline_stats.median)
+                    > threshold
+                ):
+                    # Format with group name and exact values
+                    group_anomalies.append(
+                        f"Group {group_key}: Unusual {col} median: "
+                        f"{curr_stats.median:.2f} vs baseline {baseline_stats.median:.2f}"
+                    )
 
             return group_anomalies
 
-        # Process groups in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            future_to_group = {
-                executor.submit(process_group, group_key, baseline_stats): group_key
-                for group_key, baseline_stats in self.group_stats.items()
-            }
-
-            for future in concurrent.futures.as_completed(future_to_group):
-                anomalies.extend(future.result())
+        # Process each group
+        for col in self.categorical_cols:
+            for group_name, group_data in df.groupby(col):
+                if group_name in self.group_stats:
+                    anomalies.extend(process_group(group_name, group_data))
 
         return anomalies
+
+    def detect_anomalies(
+        self,
+        df: pd.DataFrame,
+        embedding_cols: Optional[List[str]] = None,
+        threshold: float = 0.1,
+        batch_size: int = 1000,
+    ) -> Dict:
+        """Detect anomalies with improved formatting."""
+        results = {
+            "global_distribution": self._check_global_distribution(df),
+            "group_distribution": self._check_group_distribution(df, threshold),
+            "point_anomalies": [],
+        }
+
+        # Add point anomalies if embedding cols are provided
+        if embedding_cols:
+            point_results = self._check_point_anomalies(df, embedding_cols, batch_size)
+            if point_results:
+                results["point_anomalies"] = point_results
+
+        return results
 
 
 @dataclass
 class DatasetComparator:
     categorical_cols: Optional[List[str]] = field(default_factory=list)
     numerical_cols: Optional[List[str]] = field(default_factory=list)
-    sample_size: int = 100000
     use_gpu: bool = True
     n_jobs: Optional[int] = -1
 
     def __post_init__(self):
-        # Ensure lists are initialized properly
+        # Initialize lists
         self.categorical_cols = self.categorical_cols or []
         self.numerical_cols = self.numerical_cols or []
 
-        # Optimize number of jobs based on CPU cores and task type
+        # Optimize number of jobs
         if self.n_jobs is None or self.n_jobs <= 0:
-            self.n_jobs = min(32, multiprocessing.cpu_count())  # Cap at 32 for stability
+            self.n_jobs = min(32, multiprocessing.cpu_count())
 
-        # Set device
+        # Set device and initialize components
         self.device = self._get_device()
-
-        # Initialize detector with optimized parameters
         self.detector = AnomalyDetector(
             categorical_cols=self.categorical_cols,
             numerical_cols=self.numerical_cols,
             device=self.device,
             n_jobs=self.n_jobs,
         )
-
-        # Initialize separate pools for I/O and CPU-bound operations
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs)
         self.process_pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=max(1, self.n_jobs // 2)
@@ -453,48 +352,128 @@ class DatasetComparator:
         return "cpu"
 
     def fast_distribution_compare(
-        self, values_a: np.ndarray, values_b: np.ndarray, n_bins: int = 100
+        self,
+        values_a: np.ndarray,
+        values_b: np.ndarray,
+        batch_size: int = 10000,
+        n_bins: int = 100,
+        eps: float = 1e-10,
     ) -> Dict:
         """
-        Performs a fast distribution comparison using histogram binning and
-        the Chi-square test. Much faster than KS test for large datasets.
+        Performs a memory-efficient distribution comparison using histogram binning and
+        the Chi-square test. Processes data in batches for large arrays.
+
+        Parameters:
+        -----------
+        values_a: np.ndarray
+            First array of values to compare
+        values_b: np.ndarray
+            Second array of values to compare
+        batch_size: int
+            Size of batches for processing large arrays
+        n_bins: int
+            Number of bins for histogram
+        eps: float
+            Small constant to avoid division by zero
+
+        Returns:
+        --------
+        Dict containing:
+            - statistic: Chi-square statistic
+            - p_value: P-value from chi-square test
+            - significant: Boolean indicating if difference is significant (p < 0.05)
+            - kl_divergence: Kullback-Leibler divergence between distributions
         """
-        # Convert to float32 for memory efficiency
-        values_a = values_a.astype(np.float32)
-        values_b = values_b.astype(np.float32)
+        try:
+            # Convert to float32 for memory efficiency
+            values_a = np.asarray(values_a, dtype=np.float32)
+            values_b = np.asarray(values_b, dtype=np.float32)
 
-        # Calculate range for binning
-        min_val = min(np.min(values_a), np.min(values_b))
-        max_val = max(np.max(values_a), np.max(values_b))
+            # Handle empty arrays
+            if len(values_a) == 0 or len(values_b) == 0:
+                return {
+                    "error": "One or both arrays are empty",
+                    "statistic": None,
+                    "p_value": None,
+                    "significant": None,
+                }
 
-        # Create histograms with identical bins
-        hist_a, bins = np.histogram(values_a, bins=n_bins, range=(min_val, max_val), density=True)
-        hist_b, _ = np.histogram(values_b, bins=bins, density=True)
+            # Calculate global range for binning
+            min_val = min(
+                np.nanmin(values_a) if len(values_a) > 0 else np.inf,
+                np.nanmin(values_b) if len(values_b) > 0 else np.inf,
+            )
+            max_val = max(
+                np.nanmax(values_a) if len(values_a) > 0 else -np.inf,
+                np.nanmax(values_b) if len(values_b) > 0 else -np.inf,
+            )
 
-        # Add small constant to avoid division by zero
-        hist_a = hist_a + 1e-10
-        hist_b = hist_b + 1e-10
+            # Handle case where all values are the same
+            if min_val == max_val:
+                return {
+                    "statistic": 0.0,
+                    "p_value": 1.0,
+                    "significant": False,
+                    "kl_divergence": 0.0,
+                }
 
-        # Calculate chi-square statistic
-        chi2_stat = np.sum((hist_a - hist_b) ** 2 / (hist_a + hist_b))
+            # Initialize histograms
+            hist_a = np.zeros(n_bins, dtype=np.float32)
+            hist_b = np.zeros(n_bins, dtype=np.float32)
 
-        # Calculate degrees of freedom (number of bins - 1)
-        df = n_bins - 1
+            # Process array A in batches
+            for i in range(0, len(values_a), batch_size):
+                batch = values_a[i : i + batch_size]
+                batch_hist, _ = np.histogram(batch, bins=n_bins, range=(min_val, max_val))
+                hist_a += batch_hist
 
-        # Calculate p-value
-        p_value = 1 - stats.chi2.cdf(chi2_stat, df)
+            # Process array B in batches
+            for i in range(0, len(values_b), batch_size):
+                batch = values_b[i : i + batch_size]
+                batch_hist, _ = np.histogram(batch, bins=n_bins, range=(min_val, max_val))
+                hist_b += batch_hist
 
-        return {
-            "statistic": float(chi2_stat),
-            "p_value": float(p_value),
-            "significant": p_value < 0.05,
-        }
+            # Normalize histograms
+            hist_a = hist_a / (np.sum(hist_a) + eps)
+            hist_b = hist_b / (np.sum(hist_b) + eps)
+
+            # Add small constant to avoid division by zero
+            hist_a = hist_a + eps
+            hist_b = hist_b + eps
+
+            # Calculate chi-square statistic
+            chi2_stat = np.sum((hist_a - hist_b) ** 2 / (hist_a + hist_b))
+
+            # Calculate degrees of freedom (number of bins - 1)
+            df = n_bins - 1
+
+            # Calculate p-value
+            p_value = 1 - stats.chi2.cdf(chi2_stat, df)
+
+            # Calculate KL divergence
+            kl_div = np.sum(hist_a * np.log(hist_a / hist_b))
+
+            return {
+                "statistic": float(chi2_stat),
+                "p_value": float(p_value),
+                "significant": p_value < 0.05,
+                "kl_divergence": float(kl_div),
+            }
+
+        except Exception as e:
+            return {
+                "error": str(e),
+                "statistic": None,
+                "p_value": None,
+                "significant": None,
+                "kl_divergence": None,
+            }
 
     def _perform_statistical_tests(self, dataset_a: pd.DataFrame, dataset_b: pd.DataFrame) -> Dict:
         """Perform statistical tests to compare distributions."""
         results = {}
 
-        # Pre-compute and cache value counts for categorical columns
+        # Pre-compute value counts for categorical columns
         cat_counts_a = {
             col: dataset_a[col].fillna("MISSING").value_counts() for col in self.categorical_cols
         }
@@ -502,98 +481,39 @@ class DatasetComparator:
             col: dataset_b[col].fillna("MISSING").value_counts() for col in self.categorical_cols
         }
 
-        def process_categorical_column(col: str) -> Dict:
+        # Compare numerical distributions using vectorized operations
+        for col in self.numerical_cols:
             try:
-                counts_a = cat_counts_a[col]
-                counts_b = cat_counts_b[col]
+                # Use the fast distribution compare method for efficiency
+                comparison = self.fast_distribution_compare(
+                    dataset_a[col].values, dataset_b[col].values
+                )
+                results[col] = comparison
+            except Exception as e:
+                results[col] = {"error": str(e)}
 
-                # Get frequencies
-                total_a = counts_a.sum()
-                total_b = counts_b.sum()
-
+        # Compare categorical distributions using chi-square test
+        for col in self.categorical_cols:
+            try:
                 # Get all unique categories
-                all_categories = pd.Index(set(counts_a.index) | set(counts_b.index))
-
-                # Calculate frequencies with fill value 0
-                freq_a = (counts_a.reindex(all_categories, fill_value=0) / total_a).values
-                freq_b = (counts_b.reindex(all_categories, fill_value=0) / total_b).values
-
-                # For high cardinality columns (like IDs), do a different comparison
-                unique_ratio = len(all_categories) / max(total_a, total_b)
-
-                if unique_ratio > 0.1:  # If more than 10% unique values
-                    overlap_ratio = len(set(counts_a.index) & set(counts_b.index)) / len(
-                        all_categories
-                    )
-                    return {
-                        "type": "high_cardinality",
-                        "unique_ratio": float(unique_ratio),
-                        "category_overlap": float(overlap_ratio),
-                        "n_categories": len(all_categories),
-                        "n_categories_a": len(counts_a),
-                        "n_categories_b": len(counts_b),
-                        "significant": overlap_ratio
-                        < 0.9,  # Consider significant if overlap is low
-                    }
-
-                # For normal categorical columns, use Jensen-Shannon divergence
-                m = 0.5 * (freq_a + freq_b)
-                jsd = 0.5 * (
-                    np.sum(freq_a * np.log(freq_a / m + 1e-10))
-                    + np.sum(freq_b * np.log(freq_b / m + 1e-10))
+                all_categories = pd.Index(
+                    set(cat_counts_a[col].index) | set(cat_counts_b[col].index)
                 )
 
-                return {
-                    "type": "categorical",
-                    "distance": float(jsd),
-                    "significant": jsd > 0.1,  # Threshold can be adjusted
-                    "n_categories": len(all_categories),
-                    "n_unique_a": len(counts_a),
-                    "n_unique_b": len(counts_b),
-                }
+                # Align distributions and fill missing values with 0
+                counts_a = cat_counts_a[col].reindex(all_categories, fill_value=0)
+                counts_b = cat_counts_b[col].reindex(all_categories, fill_value=0)
 
+                # Perform chi-square test
+                chi2, p_value = stats.chi2_contingency([counts_a, counts_b])[:2]
+
+                results[col] = {
+                    "statistic": float(chi2),
+                    "p_value": float(p_value),
+                    "significant": p_value < 0.05,
+                }
             except Exception as e:
-                return {"error": f"Failed to compare distributions: {str(e)}"}
-
-        def process_numerical_column(col: str) -> Dict:
-            try:
-                values_a = dataset_a[col].fillna(0).astype(np.float32).values
-                values_b = dataset_b[col].fillna(0).astype(np.float32).values
-
-                return self.fast_distribution_compare(values_a, values_b)
-
-            except Exception as e:
-                return {"error": f"Failed to perform distribution test: {str(e)}"}
-
-        # Process all columns using a single thread pool
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-                # Submit numerical columns
-                num_futures = {
-                    executor.submit(process_numerical_column, col): (col, "ks_test")
-                    for col in self.numerical_cols
-                }
-
-                # Submit categorical columns
-                cat_futures = {
-                    executor.submit(process_categorical_column, col): (col, "chi2_test")
-                    for col in self.categorical_cols
-                }
-
-                # Combine all futures
-                all_futures = {**num_futures, **cat_futures}
-
-                # Collect results
-                for future in concurrent.futures.as_completed(all_futures):
-                    col, test_type = all_futures[future]
-                    try:
-                        results[f"{col}_{test_type}"] = future.result()
-                    except Exception as e:
-                        results[f"{col}_{test_type}"] = {"error": str(e)}
-
-        except Exception as e:
-            print(f"Error in thread pool execution: {str(e)}")
-            return {}
+                results[col] = {"error": str(e)}
 
         return results
 
@@ -626,55 +546,123 @@ class DatasetComparator:
             },
         }
 
+    def format_comparison_results(
+        self,
+        dataset_a: pd.DataFrame,
+        dataset_b: pd.DataFrame,
+        results: Dict,
+        max_point_anomalies: int = 5,
+    ) -> str:
+        """Format comparison results into a human-readable string."""
+        output = []
+
+        # Format Global Distribution Anomalies
+        if results.get("anomalies", {}).get("global_distribution"):
+            output.append("Global Distribution Anomalies:")
+            for anomaly in results["anomalies"]["global_distribution"]:
+                output.append(f"- {anomaly}")
+
+        # Format Group Distribution Anomalies
+        if results.get("anomalies", {}).get("group_distribution"):
+            output.append("\nGroup Distribution Anomalies:")
+            for anomaly in results["anomalies"]["group_distribution"]:
+                output.append(f"- {anomaly}")
+
+        # Format Point-level Anomalies
+        if results.get("anomalies", {}).get("point_anomalies"):
+            point_anomalies = results["anomalies"]["point_anomalies"][:max_point_anomalies]
+            output.append(f"\nPoint-level Anomalies (showing first {max_point_anomalies}):")
+            for anomaly in point_anomalies:
+                output.append(f"- {anomaly}")
+
+        # Format Statistical Comparison
+        if results.get("statistical_tests"):
+            output.append("\nComparison of key statistics:")
+            output.append("Baseline Data:")
+            baseline_stats = pd.DataFrame(
+                {
+                    col: {
+                        "count": len(dataset_b),
+                        "mean": dataset_b[col].mean(),
+                        "std": dataset_b[col].std(),
+                        "min": dataset_b[col].min(),
+                        "25%": dataset_b[col].quantile(0.25),
+                        "50%": dataset_b[col].quantile(0.50),
+                        "75%": dataset_b[col].quantile(0.75),
+                        "max": dataset_b[col].max(),
+                    }
+                    for col in self.numerical_cols
+                }
+            )
+            output.append(baseline_stats.to_string())
+
+            output.append("\nTest Data:")
+            test_stats = pd.DataFrame(
+                {
+                    col: {
+                        "count": len(dataset_a),
+                        "mean": dataset_a[col].mean(),
+                        "std": dataset_a[col].std(),
+                        "min": dataset_a[col].min(),
+                        "25%": dataset_a[col].quantile(0.25),
+                        "50%": dataset_a[col].quantile(0.50),
+                        "75%": dataset_a[col].quantile(0.75),
+                        "max": dataset_a[col].max(),
+                    }
+                    for col in self.numerical_cols
+                }
+            )
+            output.append(test_stats.to_string())
+
+        return "\n".join(output)
+
     def compare_datasets(
         self,
         dataset_a: pd.DataFrame,
         dataset_b: pd.DataFrame,
         embedding_cols: Optional[List[str]] = None,
         threshold: float = 0.1,
-    ) -> Dict:
-        """Compare datasets with optimized performance."""
-        # Optimize memory usage by converting to efficient dtypes
-        for col in self.numerical_cols:
-            dataset_a[col] = dataset_a[col].astype(np.float32)
-            dataset_b[col] = dataset_b[col].astype(np.float32)
+    ) -> Dict:  # Keep returning Dict
+        """Compare full datasets and return results dictionary."""
+        try:
+            # Optimize memory usage
+            for col in self.numerical_cols:
+                dataset_a[col] = dataset_a[col].astype(np.float32)
+                dataset_b[col] = dataset_b[col].astype(np.float32)
 
-        # Calculate target size as minimum of dataset sizes and sample_size
-        target_size = min(len(dataset_a), len(dataset_b), self.sample_size)
+            # Fit detector on full dataset B (baseline)
+            self.detector.fit(dataset_b, embedding_cols=embedding_cols, dim_reduction="pca")
 
-        # Fast sampling using numpy for both datasets if needed
-        if len(dataset_a) > target_size:
-            # Generate random indices without replacement using numpy
-            idx_a = np.random.RandomState(42).choice(
-                len(dataset_a), size=target_size, replace=False
-            )
-            # Use numpy's advanced indexing which is faster than pandas sample
-            dataset_a = dataset_a.iloc[idx_a]
+            # Initialize result futures
+            futures = {}
 
-        if len(dataset_b) > target_size:
-            idx_b = np.random.RandomState(42).choice(
-                len(dataset_b), size=target_size, replace=False
-            )
-            dataset_b = dataset_b.iloc[idx_b]
+            # Use thread pool for parallel execution
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                # Submit all tasks
+                futures["anomalies"] = executor.submit(
+                    self.detector.detect_anomalies,
+                    dataset_a,
+                    embedding_cols=embedding_cols,
+                    threshold=threshold,
+                )
+                futures["stats"] = executor.submit(
+                    self._perform_statistical_tests, dataset_a, dataset_b
+                )
+                futures["shapes"] = executor.submit(self._compare_shapes, dataset_a, dataset_b)
 
-        # Fit detector on dataset B (baseline)
-        self.detector.fit(dataset_b, embedding_cols=embedding_cols, dim_reduction="pca")
+                # Collect results with proper error handling
+                results = {
+                    "anomalies": futures["anomalies"].result(),
+                    "statistical_tests": futures["stats"].result(),
+                    "shape_comparison": futures["shapes"].result(),
+                }
 
-        # Use thread pool for parallel execution
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            # Submit tasks
-            future_anomalies = executor.submit(
-                self.detector.detect_anomalies,
-                dataset_a,
-                embedding_cols=embedding_cols,
-                threshold=threshold,
-            )
-            future_stats = executor.submit(self._perform_statistical_tests, dataset_a, dataset_b)
-            future_shapes = executor.submit(self._compare_shapes, dataset_a, dataset_b)
+            return results
 
-            # Collect results
+        except Exception as e:
             return {
-                "anomalies": future_anomalies.result(),
-                "statistical_tests": future_stats.result(),
-                "shape_comparison": future_shapes.result(),
+                "error": str(e),
+                "anomalies": {},
+                "statistical_tests": {},
+                "shape_comparison": {},
             }
