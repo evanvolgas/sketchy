@@ -11,17 +11,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 def main():
     np.random.seed(42)
 
-    # Load data and print initial counts by country
+    # Load data and preprocess
     base_data = pd.read_csv("~/Desktop/OnlineRetail.csv")
-    test_data = pd.read_csv("~/Desktop/test.csv")
-
-    print("\nBase data country distribution:")
-    print(base_data["Country"].value_counts())
-    print("\nTest data country distribution:")
-    print(test_data["Country"].value_counts())
+    test_data = pd.read_csv("~/Desktop/different.csv")
 
     def add_business_metrics(df):
-        """Add business-relevant metrics"""
         df = df.copy()
 
         # Transaction-based metrics
@@ -41,18 +35,16 @@ def main():
         return df
 
     def preprocess_data(df):
-        print(f"\nPreprocessing {len(df)} records...")
         df = df.copy()
 
         # Convert InvoiceDate to datetime
         df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"])
-        print(f"Date range: {df['InvoiceDate'].min()} to {df['InvoiceDate'].max()}")
 
         # Basic time features
         df["Hour"] = df["InvoiceDate"].dt.hour
         df["Minute"] = df["InvoiceDate"].dt.minute
 
-        # Calculate total value (absolute value for negative quantities)
+        # Calculate total value
         df["TotalValue"] = df["Quantity"].abs() * df["UnitPrice"]
 
         # Add business metrics
@@ -77,25 +69,8 @@ def main():
     base_data = preprocess_data(base_data)
     test_data = preprocess_data(test_data)
 
-    # Find common countries between datasets
-    common_countries = set(base_data["Country"].unique()) & set(test_data["Country"].unique())
-    print(f"\nCommon countries between datasets: {len(common_countries)}")
-    print(
-        "Countries only in base data:",
-        set(base_data["Country"].unique()) - set(test_data["Country"].unique()),
-    )
-    print(
-        "Countries only in test data:",
-        set(test_data["Country"].unique()) - set(base_data["Country"].unique()),
-    )
-
-    # Filter to only common countries
-    base_data = base_data[base_data["Country"].isin(common_countries)]
-    test_data = test_data[test_data["Country"].isin(common_countries)]
-
-    # Select features for anomaly detection
+    # Define features for anomaly detection
     feature_columns = [
-        # Raw metrics
         "Quantity",
         "UnitPrice",
         "TotalValue",
@@ -106,44 +81,37 @@ def main():
         "ProductTotalQuantity",
         "Price_Quantity_Ratio",
         "Value_Density",
-        # Log-transformed metrics
         "LogQuantity",
         "LogUnitPrice",
         "LogTotalValue",
         "LogItemsPerInvoice",
         "LogProductOrderCount",
         "LogProductTotalQuantity",
-        # Time features
         "Hour",
         "Minute",
     ]
 
-    # Scale features
+    # Scale features for anomaly detection only
     scaler = RobustScaler()
-    base_scaled = pd.DataFrame(
-        scaler.fit_transform(base_data[feature_columns]),
-        columns=feature_columns,
-        index=base_data.index,
-    )
-    test_scaled = pd.DataFrame(
-        scaler.transform(test_data[feature_columns]), columns=feature_columns, index=test_data.index
-    )
-
-    # Add back grouping columns
-    base_scaled["Country"] = base_data["Country"]
-    test_scaled["Country"] = test_data["Country"]
+    base_scaled = scaler.fit_transform(base_data[feature_columns])
+    test_scaled = scaler.transform(test_data[feature_columns])
 
     detector = AnomalyDetector(
-        method="both", dim_reduction="pca", n_components=2, contamination=0.1, use_gpu=True
+        method="isolation_forest",
+        dim_reduction="pca",
+        n_components=2,
+        contamination=0.1,
+        use_gpu=True,
     )
 
     print("\nFitting anomaly detector...")
-    detector.fit(base_scaled[feature_columns])
+    detector.fit(base_scaled)
 
     print("\nAnalyzing results...")
+    # Use unscaled data for analysis
     analyze_and_print_results(
-        base_data=base_scaled,
-        test_data=test_scaled,
+        base_data=base_data,
+        test_data=test_data,
         detector=detector,
         numeric_columns=feature_columns,
         group_by="Country",
