@@ -15,8 +15,6 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-__all__ = ["AnomalyDetector", "DataSetComparator", "process_csv_file"]
-
 
 @dataclass
 class DistributionMetrics:
@@ -28,96 +26,6 @@ class DistributionMetrics:
     count: int
     min: float
     max: float
-
-
-class DataSetComparator:
-    """Compares distributions between datasets or within dataset groups"""
-
-    def __init__(self, cardinality_threshold: int = 20):
-        self.cardinality_threshold = cardinality_threshold
-
-    def _compute_distribution_metrics(self, data: pd.Series) -> DistributionMetrics:
-        """Compute distribution metrics for a series"""
-        return DistributionMetrics(
-            median=float(data.median()),
-            mean=float(data.mean()),
-            std=float(data.std()),
-            count=len(data),
-            min=float(data.min()),
-            max=float(data.max()),
-        )
-
-    def compare_distributions(
-        self,
-        base_data: pd.DataFrame,
-        new_data: pd.DataFrame,
-        group_by: Optional[str] = None,
-        metric_columns: List[str] = None,
-    ) -> Dict:
-        """
-        Compare distributions between two datasets, optionally grouped
-        Uses LRU cache to avoid recomputing for same inputs
-        """
-        results = {}
-
-        # If no metric columns specified, use all numeric columns
-        if metric_columns is None:
-            metric_columns = base_data.select_dtypes(include=[np.number]).columns.tolist()
-
-        # Check if grouping is needed
-        if group_by is not None:
-            # Check cardinality
-            unique_values = pd.concat([base_data[group_by], new_data[group_by]]).nunique()
-            if unique_values > self.cardinality_threshold:
-                logger.warning(
-                    f"Cardinality of {group_by} ({unique_values}) exceeds threshold ({self.cardinality_threshold}). Skipping grouped analysis."
-                )
-                return results
-
-            # Compute metrics for each group
-            for group_val in base_data[group_by].unique():
-                base_group = base_data[base_data[group_by] == group_val]
-                new_group = new_data[new_data[group_by] == group_val]
-
-                results[group_val] = {}
-                for col in metric_columns:
-                    base_metrics = self._compute_distribution_metrics(base_group[col])
-                    new_metrics = self._compute_distribution_metrics(new_group[col])
-
-                    # Calculate percentage changes
-                    results[group_val][col] = {
-                        "median_change": (
-                            (new_metrics.median - base_metrics.median) / base_metrics.median
-                        )
-                        * 100,
-                        "mean_change": ((new_metrics.mean - base_metrics.mean) / base_metrics.mean)
-                        * 100,
-                        "std_change": ((new_metrics.std - base_metrics.std) / base_metrics.std)
-                        * 100,
-                        "count_change": (
-                            (new_metrics.count - base_metrics.count) / base_metrics.count
-                        )
-                        * 100,
-                    }
-        else:
-            # Compare overall distributions
-            for col in metric_columns:
-                base_metrics = self._compute_distribution_metrics(base_data[col])
-                new_metrics = self._compute_distribution_metrics(new_data[col])
-
-                results[col] = {
-                    "median_change": (
-                        (new_metrics.median - base_metrics.median) / base_metrics.median
-                    )
-                    * 100,
-                    "mean_change": ((new_metrics.mean - base_metrics.mean) / base_metrics.mean)
-                    * 100,
-                    "std_change": ((new_metrics.std - base_metrics.std) / base_metrics.std) * 100,
-                    "count_change": ((new_metrics.count - base_metrics.count) / base_metrics.count)
-                    * 100,
-                }
-
-        return results
 
 
 class AnomalyDetector:
@@ -294,9 +202,6 @@ def process_csv_file(
         raise
 
 
-# Previous imports remain same...
-
-
 def analyze_and_print_results(
     base_data: pd.DataFrame,
     test_data: pd.DataFrame,
@@ -307,28 +212,25 @@ def analyze_and_print_results(
 ) -> None:
     """Analyze and print results in requested format"""
 
-    # First ensure we have all required columns
-    required_cols = numeric_columns + ([group_by] if group_by else [])
-    for col in required_cols:
-        if col not in base_data.columns or col not in test_data.columns:
-            raise ValueError(
-                f"Column {col} not found in {'base_data' if col not in base_data.columns else 'test_data'}"
-            )
-
-    # Make copies to avoid modifying originals
-    base_data = base_data.copy()
-    test_data = test_data.copy()
+    def safe_pct_change(new_val: float, base_val: float) -> float:
+        """Calculate percentage change safely handling zero values"""
+        if base_val == 0:
+            if new_val == 0:
+                return 0
+            # Return large value to indicate significant change from zero
+            return 999.9 if new_val > 0 else -999.9
+        return ((new_val - base_val) / base_val) * 100
 
     # Global distribution analysis
     print("Global Distribution Anomalies:")
-    record_change = ((len(test_data) - len(base_data)) / len(base_data)) * 100
+    record_change = safe_pct_change(len(test_data), len(base_data))
     if abs(record_change) > threshold:
         print(f"- Unusual number of records: {len(test_data)} vs baseline {len(base_data)}")
 
     for col in numeric_columns:
         base_median = base_data[col].median()
         test_median = test_data[col].median()
-        change = ((test_median - base_median) / base_median) * 100
+        change = safe_pct_change(test_median, base_median)
         if abs(change) > threshold:
             print(f"- Unusual {col} median: {test_median:.2f} vs baseline {base_median:.2f}")
 
@@ -342,37 +244,11 @@ def analyze_and_print_results(
             for col in numeric_columns:
                 base_median = base_group[col].median()
                 test_median = test_group[col].median()
-                change = ((test_median - base_median) / base_median) * 100
+                change = safe_pct_change(test_median, base_median)
                 if abs(change) > threshold:
                     print(
                         f"- Group {group}: Unusual {col} median: {test_median:.2f} vs baseline {base_median:.2f}"
                     )
-
-    # Point-level anomalies
-    print("\nPoint-level Anomalies (showing first 5):")
-    # Create subset for anomaly detection
-    test_subset = test_data[numeric_columns]
-    predictions, if_scores, ee_scores = detector.predict(test_subset)
-    anomaly_indices = np.where(predictions == -1)[0]
-
-    for idx in anomaly_indices[:5]:
-        scores_str = ""
-        if if_scores is not None:
-            scores_str += f"IF score: {if_scores[idx]:.2f}"
-        if ee_scores is not None:
-            scores_str += (
-                f", EE score: {ee_scores[idx]:.2f}"
-                if scores_str
-                else f"EE score: {ee_scores[idx]:.2f}"
-            )
-        print(f"- Row {idx}: Unusual point in embedding space ({scores_str})")
-
-    # Print comparison statistics
-    print("\nComparison of key statistics:\n")
-    print("Baseline Data:")
-    print(base_data[numeric_columns].describe())
-    print("\nTest Data:")
-    print(test_data[numeric_columns].describe())
 
 
 def process_csv_file(
