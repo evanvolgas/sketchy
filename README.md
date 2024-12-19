@@ -1,4 +1,5 @@
-<img width="364" alt="Screenshot 2024-12-19 at 9 08 05 AM" src="https://github.com/user-attachments/assets/b1766da3-bdca-41be-b822-b4b14121edc5" />
+
+<img width="372" alt="Screenshot 2024-12-19 at 9 10 44 AM" src="https://github.com/user-attachments/assets/0eb37b93-4c73-446c-a694-78b0132ac3f4" />
 
 
 Sketchy is an anomally and novelty detection library designed to detect shifts in data distributions. As of Dec 19, 2024, it is being actively developed as a side project. 
