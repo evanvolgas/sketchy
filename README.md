@@ -6,4 +6,4 @@ Sketchy is an anomally and novelty detection library designed to detect shifts i
 
 Please feel free to get in touch if you have any questions, thoughts, or ideas. 
 
-evan //at// misfitideas dot com
+evan.volgas //at// {gmail.com}
