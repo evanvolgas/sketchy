@@ -6,13 +6,19 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+base_data = pd.read_csv("~/Desktop/OnlineRetail.csv")
+
 
 def main():
     np.random.seed(42)
 
     # Create baseline data
     base_data = pd.read_csv("~/Desktop/OnlineRetail.csv")
-    test_data = pd.read_csv("~/Desktop/test.csv")
+    test_data = pd.read_csv("~/Desktop/different.csv")
+
+    # Drop any NaN values
+    base_data = base_data.dropna()
+    test_data = test_data.dropna()
 
     # Print column names to see what's available
     print("Base data columns:", base_data.columns.tolist())
